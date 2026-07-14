@@ -1,4 +1,5 @@
-export type Lang = "en" | "id" | "ja";
+export const LANGS = ["en", "id", "ja"] as const;
+export type Lang = (typeof LANGS)[number];
 
 const en = {
   nav: {

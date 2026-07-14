@@ -15,6 +15,10 @@
 -- but we declare the dependency explicitly so the file is self-contained).
 create extension if not exists "pgcrypto";
 
+-- btree_gist lets the bookings exclusion constraint mix `=` on homestay_id with
+-- `&&` on the date range, which is how double-booking is made impossible.
+create extension if not exists "btree_gist";
+
 -- -----------------------------------------------------------------------------
 -- Enums
 -- -----------------------------------------------------------------------------
@@ -32,6 +36,10 @@ exception when duplicate_object then null; end $$;
 
 do $$ begin
   create type whatsapp_status as enum ('sent', 'delivered', 'failed');
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create type booking_type as enum ('stay', 'experience', 'bundle');
 exception when duplicate_object then null; end $$;
 
 -- -----------------------------------------------------------------------------
@@ -109,20 +117,36 @@ create table if not exists experiences (
 -- -----------------------------------------------------------------------------
 -- tourist_id is nullable: the MVP supports guest checkout (no tourist auth
 -- yet), so guest_name / guest_phone carry the traveller's details instead.
+--
+-- homestay_id is nullable too: an experience-only booking has no overnight
+-- stay. Those are same-day, hence check_out >= check_in rather than >.
 create table if not exists bookings (
   id              uuid primary key default gen_random_uuid(),
   tourist_id      uuid references profiles (id) on delete restrict,
   guest_name      text,
   guest_phone     text,
-  homestay_id     uuid not null references homestays (id) on delete restrict,
+  homestay_id     uuid references homestays (id) on delete restrict,
   experience_ids  uuid[] not null default '{}',
+  booking_type    booking_type not null default 'stay',
   check_in        date not null,
   check_out       date not null,
   total_amount    numeric(12,2) not null check (total_amount >= 0),
   status          booking_status not null default 'pending',
   created_at      timestamptz not null default now(),
   updated_at      timestamptz not null default now(),
-  constraint bookings_dates_valid check (check_out > check_in)
+  constraint bookings_dates_valid check (check_out >= check_in),
+
+  -- No double-booking: two live bookings can never hold overlapping nights in
+  -- the same homestay. The app pre-checks availability for a friendly error,
+  -- but that check is racy — this constraint is the authority.
+  constraint bookings_no_overlap exclude using gist (
+    homestay_id with =,
+    daterange(check_in, check_out, '[)') with &&
+  ) where (
+    homestay_id is not null
+    and status <> 'cancelled'
+    and check_out > check_in
+  )
 );
 
 -- -----------------------------------------------------------------------------
@@ -158,6 +182,22 @@ create table if not exists whatsapp_logs (
 );
 
 -- -----------------------------------------------------------------------------
+-- reviews
+-- One per booking, tied to the homestay and/or the experience being reviewed.
+-- Only the booking holder can leave one (enforced in submitReview).
+-- -----------------------------------------------------------------------------
+create table if not exists reviews (
+  id            uuid primary key default gen_random_uuid(),
+  booking_id    uuid unique not null references bookings (id) on delete cascade,
+  tourist_name  text not null,
+  homestay_id   uuid references homestays   (id) on delete set null,
+  experience_id uuid references experiences (id) on delete set null,
+  rating        smallint not null check (rating between 1 and 5),
+  comment       text,
+  created_at    timestamptz not null default now()
+);
+
+-- -----------------------------------------------------------------------------
 -- Indexes for the common access paths
 -- -----------------------------------------------------------------------------
 create index if not exists idx_homestays_village      on homestays (village_id);
@@ -168,6 +208,9 @@ create index if not exists idx_bookings_homestay       on bookings (homestay_id)
 create index if not exists idx_bookings_status         on bookings (status);
 create index if not exists idx_distributions_status    on distributions (status);
 create index if not exists idx_whatsapp_logs_booking   on whatsapp_logs (booking_id);
+create index if not exists idx_reviews_homestay        on reviews (homestay_id);
+create index if not exists idx_reviews_experience      on reviews (experience_id);
+create index if not exists idx_reviews_booking         on reviews (booking_id);
 
 -- -----------------------------------------------------------------------------
 -- updated_at maintenance
@@ -193,11 +236,85 @@ end $$;
 
 -- -----------------------------------------------------------------------------
 -- Row Level Security
--- Left DISABLED for the MVP so the mocked booking + concierge flow can write
--- freely via the service role. Before any public launch, enable RLS on every
--- table and add policies (tourists read their own bookings, admins manage
--- villages/homestays, etc.). Tracked as a Step 4+ follow-up.
+--
+-- The anon key ships to the browser by design, so anything anon can reach is
+-- effectively public. The posture:
+--
+--   anon / authenticated  → SELECT only, and only the public catalog
+--                           (villages, homestays, experiences, reviews).
+--                           Contact numbers are withheld at column level,
+--                           because Postgres has no column-level RLS — the
+--                           column list on GRANT is what does that job.
+--   service_role          → full access; bypasses RLS by definition. Every
+--                           write goes through a Server Action using it.
+--
+-- bookings / distributions / whatsapp_logs / profiles get RLS enabled and NO
+-- policy: with RLS on and no policy, every anon access is denied by default.
+-- App code reading those must use createAdminClient(), not the anon client.
 -- -----------------------------------------------------------------------------
+
+revoke all on villages      from anon, authenticated;
+revoke all on homestays     from anon, authenticated;
+revoke all on experiences   from anon, authenticated;
+revoke all on reviews       from anon, authenticated;
+revoke all on bookings      from anon, authenticated;
+revoke all on distributions from anon, authenticated;
+revoke all on whatsapp_logs from anon, authenticated;
+revoke all on profiles      from anon, authenticated;
+
+grant select on reviews to anon, authenticated;
+
+-- Note what is absent from these column lists: villages.bumdes_bank_account,
+-- homestays.host_whatsapp_number, experiences.guide_whatsapp_number.
+grant select (id, name, region, sanitation_rating, description, hero_image_url, created_at)
+  on villages to anon, authenticated;
+
+grant select (id, village_id, price_per_night, max_guests, amenities, created_at)
+  on homestays to anon, authenticated;
+
+grant select (id, village_id, title, description, category, price_per_pax, created_at)
+  on experiences to anon, authenticated;
+
+alter table villages      enable row level security;
+alter table homestays     enable row level security;
+alter table experiences   enable row level security;
+alter table reviews       enable row level security;
+alter table bookings      enable row level security;
+alter table distributions enable row level security;
+alter table whatsapp_logs enable row level security;
+alter table profiles      enable row level security;
+
+-- Only certified villages (sanitation >= 4) are visible — the same threshold
+-- MIN_RATING_TO_LIST enforces in the UI, now enforced by the database too.
+drop policy if exists villages_public_read on villages;
+create policy villages_public_read on villages
+  for select to anon, authenticated
+  using (sanitation_rating >= 4);
+
+drop policy if exists homestays_public_read on homestays;
+create policy homestays_public_read on homestays
+  for select to anon, authenticated
+  using (
+    exists (
+      select 1 from villages v
+      where v.id = homestays.village_id and v.sanitation_rating >= 4
+    )
+  );
+
+drop policy if exists experiences_public_read on experiences;
+create policy experiences_public_read on experiences
+  for select to anon, authenticated
+  using (
+    exists (
+      select 1 from villages v
+      where v.id = experiences.village_id and v.sanitation_rating >= 4
+    )
+  );
+
+drop policy if exists reviews_public_read on reviews;
+create policy reviews_public_read on reviews
+  for select to anon, authenticated
+  using (true);
 -- alter table profiles      enable row level security;
 -- alter table villages      enable row level security;
 -- alter table homestays     enable row level security;

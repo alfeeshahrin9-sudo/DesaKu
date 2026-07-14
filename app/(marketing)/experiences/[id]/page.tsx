@@ -21,7 +21,8 @@ export default async function ExperienceDetailPage({ params }: Params) {
 
   const { data } = await supabase
     .from("experiences")
-    .select("id, title, description, category, price_per_pax, guide_whatsapp_number, villages(id, name, region, hero_image_url, sanitation_rating)")
+    // guide_whatsapp_number is withheld from anon at column level (migration 0003).
+    .select("id, title, description, category, price_per_pax, villages(id, name, region, hero_image_url, sanitation_rating)")
     .eq("id", id)
     .single();
 
@@ -30,7 +31,6 @@ export default async function ExperienceDetailPage({ params }: Params) {
   const exp = data as unknown as {
     id: string; title: string; description: string | null;
     category: string | null; price_per_pax: number;
-    guide_whatsapp_number: string;
     villages: { id: string; name: string; region: string | null; hero_image_url: string | null; sanitation_rating: number } | null;
   };
 

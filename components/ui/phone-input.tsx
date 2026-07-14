@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Input } from "@/components/ui/input";
 
 const CC_OPTIONS = [
@@ -53,29 +53,26 @@ export function PhoneInput({
   placeholder?: string;
   id?: string;
 }) {
+  // `value` is the single source of truth, so the field always reflects the
+  // parent (including an external reset) without an effect syncing it back.
+  // The one thing it can't carry is the dialling code chosen while the number
+  // is still empty — there'd be nothing to parse it out of — so that alone is
+  // remembered locally.
   const parsed = splitPhone(value);
-  const [cc, setCc]             = useState(parsed.cc);
-  const [national, setNational] = useState(parsed.national);
+  const hasNumber = parsed.national.length > 0;
+  const [pendingCc, setPendingCc] = useState(parsed.cc);
 
-  // Sync when parent resets the field externally (e.g. form clear)
-  useEffect(() => {
-    const { cc: newCc, national: newNational } = splitPhone(value);
-    if (newCc !== cc || newNational !== national) {
-      setCc(newCc);
-      setNational(newNational);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value]);
+  const cc = hasNumber ? parsed.cc : pendingCc;
+  const national = parsed.national;
 
   function handleCc(newCc: string) {
-    setCc(newCc);
-    onChange(newCc + national);
+    setPendingCc(newCc);
+    onChange(national ? newCc + national : "");
   }
 
   function handleNational(raw: string) {
     const digits = raw.replace(/\D/g, "");
-    setNational(digits);
-    onChange(cc + digits);
+    onChange(digits ? cc + digits : "");
   }
 
   return (

@@ -3,8 +3,24 @@
 import { createAdminClient } from "@/lib/supabase/admin";
 import { calculateDistribution } from "@/lib/distribution";
 import { nightsBetween } from "@/lib/format";
+import { MIN_RATING_TO_LIST } from "@/lib/sanitation";
 
 export type BookingType = "stay" | "experience" | "bundle";
+
+type HomestayWithVillage = {
+  id: string;
+  village_id: string;
+  price_per_night: number;
+  max_guests: number | null;
+  villages: { sanitation_rating: number | null } | null;
+};
+
+type ExperienceWithVillage = {
+  id: string;
+  village_id: string;
+  price_per_pax: number;
+  villages: { sanitation_rating: number | null } | null;
+};
 
 export type CreateBookingInput = {
   bookingType: BookingType;
@@ -47,15 +63,37 @@ export async function createBooking(
 
     const { data: homestay, error: hErr } = await supabase
       .from("homestays")
-      .select("id, village_id, price_per_night, max_guests")
+      .select("id, village_id, price_per_night, max_guests, villages(sanitation_rating)")
       .eq("id", input.homestayId)
-      .single();
+      .single<HomestayWithVillage>();
 
     if (hErr || !homestay) {
       return { ok: false, error: "That homestay is no longer available." };
     }
     if (homestay.max_guests && guests > homestay.max_guests) {
       return { ok: false, error: `This homestay sleeps up to ${homestay.max_guests} guests.` };
+    }
+    // The listing pages already filter on this, but a Server Action is reachable
+    // by direct POST — so an uncertified village must be refused here too.
+    if ((homestay.villages?.sanitation_rating ?? 0) < MIN_RATING_TO_LIST) {
+      return { ok: false, error: "That village isn't certified for booking yet." };
+    }
+
+    // Availability. The bookings_no_overlap exclusion constraint is the real
+    // authority (this read is racy); we check first only to return a friendly
+    // error instead of a constraint violation in the common case.
+    const { data: clashes, error: cErr } = await supabase
+      .from("bookings")
+      .select("id")
+      .eq("homestay_id", input.homestayId)
+      .neq("status", "cancelled")
+      .lt("check_in", input.checkOut)
+      .gt("check_out", input.checkIn)
+      .limit(1);
+
+    if (cErr) return { ok: false, error: "Could not check availability." };
+    if (clashes && clashes.length > 0) {
+      return { ok: false, error: "Those dates are already booked. Try different nights." };
     }
 
     lodging = Number(homestay.price_per_night) * nights;
@@ -75,24 +113,33 @@ export async function createBooking(
   if (experienceIds.length > 0) {
     let expQuery = supabase
       .from("experiences")
-      .select("id, price_per_pax, village_id")
+      .select("id, price_per_pax, village_id, villages(sanitation_rating)")
       .in("id", experienceIds);
 
     // For stays/bundles, experiences must belong to the same village.
     if (villageId) expQuery = expQuery.eq("village_id", villageId);
 
-    const { data: experiences, error: eErr } = await expQuery;
+    const { data, error: eErr } = await expQuery.returns<ExperienceWithVillage[]>();
     if (eErr) return { ok: false, error: "Could not price the experiences." };
-    if ((experiences?.length ?? 0) !== experienceIds.length) {
+
+    const experiences = data ?? [];
+    if (experiences.length !== experienceIds.length) {
       return { ok: false, error: "One or more experiences are unavailable." };
+    }
+    if (
+      experiences.some(
+        (e) => (e.villages?.sanitation_rating ?? 0) < MIN_RATING_TO_LIST,
+      )
+    ) {
+      return { ok: false, error: "That village isn't certified for booking yet." };
     }
 
     // For standalone experience bookings, lock in the village from the first exp.
-    if (!villageId && experiences?.length) {
+    if (!villageId && experiences.length) {
       villageId = experiences[0].village_id;
     }
 
-    experiencesTotal = (experiences ?? []).reduce(
+    experiencesTotal = experiences.reduce(
       (sum, e) => sum + Number(e.price_per_pax) * guests,
       0,
     );
@@ -126,6 +173,11 @@ export async function createBooking(
     .single();
 
   if (bErr || !booking) {
+    // 23P01 = exclusion_violation: someone took these nights between our
+    // availability check above and this insert.
+    if (bErr?.code === "23P01") {
+      return { ok: false, error: "Those dates were just booked. Try different nights." };
+    }
     return { ok: false, error: bErr?.message ?? "Could not create the booking." };
   }
 

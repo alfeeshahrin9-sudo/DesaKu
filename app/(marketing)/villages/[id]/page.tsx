@@ -16,8 +16,11 @@ export default async function VillageDetailPage({ params }: Params) {
   const { data: villageData } = await supabase
     .from("villages")
     .select(
-      "id, name, region, description, hero_image_url, sanitation_rating, bumdes_bank_account, " +
-        "homestays(id, host_whatsapp_number, price_per_night, max_guests, amenities), " +
+      // bumdes_bank_account and host_whatsapp_number are absent on purpose: the
+      // page never rendered them, and anon has no column grant for either
+      // (migration 0003).
+      "id, name, region, description, hero_image_url, sanitation_rating, " +
+        "homestays(id, price_per_night, max_guests, amenities), " +
         "experiences(id, title, description, category, price_per_pax)",
     )
     .eq("id", id)
@@ -144,7 +147,6 @@ export default async function VillageDetailPage({ params }: Params) {
 
 export type BookingHomestay = {
   id: string;
-  host_whatsapp_number: string;
   price_per_night: number;
   max_guests: number | null;
   amenities: Record<string, boolean> | null;
@@ -165,7 +167,6 @@ type VillageDetailRow = {
   description: string | null;
   hero_image_url: string | null;
   sanitation_rating: number | null;
-  bumdes_bank_account: string | null;
   homestays: BookingHomestay[];
   experiences: BookingExperience[];
 };

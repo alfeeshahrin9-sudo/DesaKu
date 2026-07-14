@@ -7,6 +7,13 @@ export type ReviewResult =
   | { ok: true }
   | { ok: false; error: string };
 
+/**
+ * Guest checkout means there is no tourist login to authorise against, so the
+ * booking's UUID acts as the bearer token: knowing it is what proves you are
+ * the traveller. That only holds because RLS denies anon any access to
+ * `bookings` (migration 0003) — the IDs cannot be enumerated. Revisit when
+ * tourist auth lands.
+ */
 export async function submitReview(
   bookingId: string,
   rating: number,
@@ -60,7 +67,20 @@ export async function submitReview(
   if (rErr) return { ok: false, error: rErr.message };
 
   revalidatePath(`/bookings/${bookingId}`);
-  if (homestayId) revalidatePath(`/villages/${booking.homestay_id}`);
+
+  // The village page is keyed by village id, not homestay id — resolve it,
+  // otherwise the review never shows up on the village's review list.
+  if (homestayId) {
+    const { data: homestay } = await supabase
+      .from("homestays")
+      .select("village_id")
+      .eq("id", homestayId)
+      .single();
+
+    if (homestay?.village_id) revalidatePath(`/villages/${homestay.village_id}`);
+  }
+
+  if (experienceId) revalidatePath(`/experiences/${experienceId}`);
 
   return { ok: true };
 }

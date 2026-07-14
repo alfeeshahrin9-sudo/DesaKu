@@ -1,179 +1,197 @@
-import Link from "next/link";
-import { notFound } from "next/navigation";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { rupiah, nightsBetween } from "@/lib/format";
-import { ReviewForm } from "@/components/booking/review-form";
-import { getLang } from "@/lib/i18n-server";
-import { translations } from "@/lib/i18n";
+"use server";
 
-type Params = { params: Promise<{ id: string }> };
+import { createAdminClient } from "@/lib/supabase/admin";
+import { calculateDistribution } from "@/lib/distribution";
+import { nightsBetween } from "@/lib/format";
+import { MIN_RATING_TO_LIST } from "@/lib/sanitation";
 
-type Dist = {
-  host_amount: number;
-  guide_amount: number;
-  bumdes_amount: number;
-  status: string;
-};
+export type BookingType = "stay" | "experience" | "bundle";
 
-type BookingRow = {
+type HomestayWithVillage = {
   id: string;
-  guest_name: string | null;
-  check_in: string;
-  check_out: string;
-  total_amount: number;
-  status: string;
-  experience_ids: string[] | null;
-  homestays: {
-    price_per_night: number;
-    host_whatsapp_number: string;
-    villages: { name: string; region: string | null } | null;
-  } | null;
-  distributions: Dist | Dist[] | null;
+  village_id: string;
+  price_per_night: number;
+  max_guests: number | null;
+  villages: { sanitation_rating: number | null } | null;
 };
 
-export default async function BookingConfirmationPage({ params }: Params) {
-  const [{ id }, lang] = await Promise.all([params, getLang()]);
-  const t = translations[lang];
-  const supabase = await createSupabaseServerClient();
+type ExperienceWithVillage = {
+  id: string;
+  village_id: string;
+  price_per_pax: number;
+  villages: { sanitation_rating: number | null } | null;
+};
 
-  const { data } = await supabase
+export type CreateBookingInput = {
+  bookingType: BookingType;
+  homestayId: string | null;
+  experienceIds: string[];
+  checkIn: string;
+  checkOut: string;
+  guests: number;
+  guestName: string;
+  guestPhone: string;
+};
+
+export type CreateBookingResult =
+  | { ok: true; bookingId: string }
+  | { ok: false; error: string };
+
+export async function createBooking(
+  input: CreateBookingInput,
+): Promise<CreateBookingResult> {
+  const guestName = input.guestName?.trim();
+  if (!guestName) return { ok: false, error: "Please tell us who's travelling." };
+
+  const guests = Math.max(1, Math.floor(input.guests || 1));
+  const supabase = createAdminClient();
+  const experienceIds = [...new Set(input.experienceIds ?? [])];
+
+  let lodging = 0;
+  let villageId: string | null = null;
+  let homestayId: string | null = null;
+
+  // ── Stays & bundles: validate the homestay ──────────────────────────────
+  if (input.bookingType === "stay" || input.bookingType === "bundle") {
+    if (!input.homestayId) {
+      return { ok: false, error: "Choose a homestay for an overnight stay." };
+    }
+    const nights = nightsBetween(input.checkIn, input.checkOut);
+    if (nights < 1) {
+      return { ok: false, error: "Check-out must be after check-in." };
+    }
+
+    const { data: homestay, error: hErr } = await supabase
+      .from("homestays")
+      .select("id, village_id, price_per_night, max_guests, villages(sanitation_rating)")
+      .eq("id", input.homestayId)
+      .single<HomestayWithVillage>();
+
+    if (hErr || !homestay) {
+      return { ok: false, error: "That homestay is no longer available." };
+    }
+    if (homestay.max_guests && guests > homestay.max_guests) {
+      return { ok: false, error: `This homestay sleeps up to ${homestay.max_guests} guests.` };
+    }
+    // The listing pages already filter on this, but a Server Action is reachable
+    // by direct POST — so an uncertified village must be refused here too.
+    if ((homestay.villages?.sanitation_rating ?? 0) < MIN_RATING_TO_LIST) {
+      return { ok: false, error: "That village isn't certified for booking yet." };
+    }
+
+    // Availability. The bookings_no_overlap exclusion constraint is the real
+    // authority (this read is racy); we check first only to return a friendly
+    // error instead of a constraint violation in the common case.
+    const { data: clashes, error: cErr } = await supabase
+      .from("bookings")
+      .select("id")
+      .eq("homestay_id", input.homestayId)
+      .neq("status", "cancelled")
+      .lt("check_in", input.checkOut)
+      .gt("check_out", input.checkIn)
+      .limit(1);
+
+    if (cErr) return { ok: false, error: "Could not check availability." };
+    if (clashes && clashes.length > 0) {
+      return { ok: false, error: "Those dates are already booked. Try different nights." };
+    }
+
+    lodging = Number(homestay.price_per_night) * nights;
+    villageId = homestay.village_id;
+    homestayId = homestay.id;
+  }
+
+  // ── Experiences: require at least one for experience/bundle types ────────
+  if (input.bookingType === "experience" || input.bookingType === "bundle") {
+    if (experienceIds.length === 0) {
+      return { ok: false, error: "Choose at least one experience." };
+    }
+  }
+
+  // ── Price experiences (re-read from DB, never trust client) ─────────────
+  let experiencesTotal = 0;
+  if (experienceIds.length > 0) {
+    let expQuery = supabase
+      .from("experiences")
+      .select("id, price_per_pax, village_id, villages(sanitation_rating)")
+      .in("id", experienceIds);
+
+    // For stays/bundles, experiences must belong to the same village.
+    if (villageId) expQuery = expQuery.eq("village_id", villageId);
+
+    const { data, error: eErr } = await expQuery.returns<ExperienceWithVillage[]>();
+    if (eErr) return { ok: false, error: "Could not price the experiences." };
+
+    const experiences = data ?? [];
+    if (experiences.length !== experienceIds.length) {
+      return { ok: false, error: "One or more experiences are unavailable." };
+    }
+    if (
+      experiences.some(
+        (e) => (e.villages?.sanitation_rating ?? 0) < MIN_RATING_TO_LIST,
+      )
+    ) {
+      return { ok: false, error: "That village isn't certified for booking yet." };
+    }
+
+    // For standalone experience bookings, lock in the village from the first exp.
+    if (!villageId && experiences.length) {
+      villageId = experiences[0].village_id;
+    }
+
+    experiencesTotal = experiences.reduce(
+      (sum, e) => sum + Number(e.price_per_pax) * guests,
+      0,
+    );
+  }
+
+  const total = lodging + experiencesTotal;
+  if (total <= 0) return { ok: false, error: "Total amount must be greater than zero." };
+
+  const split = calculateDistribution(total);
+
+  // For experience-only bookings check_in = check_out (same day).
+  const checkIn = input.checkIn;
+  const checkOut =
+    input.bookingType === "experience" ? input.checkIn : input.checkOut;
+
+  const { data: booking, error: bErr } = await supabase
     .from("bookings")
-    .select(
-      "id, guest_name, check_in, check_out, total_amount, status, experience_ids, " +
-        "homestays(price_per_night, host_whatsapp_number, villages(name, region)), " +
-        "distributions(host_amount, guide_amount, bumdes_amount, status)",
-    )
-    .eq("id", id)
-    .single();
-
-  if (!data) notFound();
-
-  const booking = data as unknown as BookingRow;
-  const homestay = booking.homestays;
-  const village = homestay?.villages ?? null;
-
-  const { data: existingReview } = await supabase
-    .from("reviews")
+    .insert({
+      tourist_id: null,
+      guest_name: guestName,
+      guest_phone: input.guestPhone?.trim() || null,
+      homestay_id: homestayId,
+      experience_ids: experienceIds,
+      check_in: checkIn,
+      check_out: checkOut,
+      total_amount: total,
+      booking_type: input.bookingType,
+      status: "pending",
+    })
     .select("id")
-    .eq("booking_id", id)
     .single();
 
-  const dist = Array.isArray(booking.distributions)
-    ? booking.distributions[0]
-    : booking.distributions;
+  if (bErr || !booking) {
+    // 23P01 = exclusion_violation: someone took these nights between our
+    // availability check above and this insert.
+    if (bErr?.code === "23P01") {
+      return { ok: false, error: "Those dates were just booked. Try different nights." };
+    }
+    return { ok: false, error: bErr?.message ?? "Could not create the booking." };
+  }
 
-  const statusLabel = t.confirmation.statusLabels[booking.status as keyof typeof t.confirmation.statusLabels]
-    ?? t.confirmation.statusLabels.pending;
-  const statusNote  = t.confirmation.statusNotes[booking.status as keyof typeof t.confirmation.statusNotes]
-    ?? t.confirmation.statusNotes.pending;
+  const { error: dErr } = await supabase.from("distributions").insert({
+    booking_id: booking.id,
+    host_amount: split.host,
+    guide_amount: split.guide,
+    bumdes_amount: split.bumdes,
+    status: "pending",
+  });
 
-  const nights = nightsBetween(booking.check_in, booking.check_out);
+  if (dErr) {
+    return { ok: false, error: `Booking saved, but split failed: ${dErr.message}` };
+  }
 
-  const splitRows = dist
-    ? [
-        { label: t.booking.host,    pct: 50, amount: dist.host_amount,   bg: "bg-palm" },
-        { label: t.booking.guide,   pct: 30, amount: dist.guide_amount,  bg: "bg-clay" },
-        { label: t.booking.village, pct: 20, amount: dist.bumdes_amount, bg: "bg-gold" },
-      ]
-    : [];
-
-  return (
-    <div className="mx-auto max-w-2xl px-5 py-16">
-      <span className="text-xs font-semibold uppercase tracking-[0.25em] text-clay">
-        {t.confirmation.status}
-      </span>
-      <h1 className="mt-3 font-display text-4xl font-bold tracking-tight text-ink">
-        {t.confirmation.greeting(booking.guest_name?.split(" ")[0] ?? "traveller")}
-      </h1>
-      <p className="mt-3 text-lg text-ink/70">{statusNote}</p>
-
-      <div className="mt-10 rounded-xl border border-line bg-card p-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="font-display text-2xl font-semibold text-ink">
-              {village?.name ?? "Homestay"}
-            </p>
-            {village?.region && (
-              <p className="text-sm text-muted-foreground">{village.region}</p>
-            )}
-          </div>
-          <span className="rounded-full bg-secondary px-3 py-1 text-xs font-semibold text-palm-deep">
-            {statusLabel}
-          </span>
-        </div>
-
-        <dl className="mt-6 grid grid-cols-2 gap-4 text-sm">
-          <div>
-            <dt className="text-muted-foreground">{t.confirmation.checkin}</dt>
-            <dd className="text-ink">{booking.check_in}</dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t.confirmation.checkout}</dt>
-            <dd className="text-ink">
-              {booking.check_out}{" "}
-              <span className="text-muted-foreground">
-                ({t.booking.nights(nights)})
-              </span>
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t.confirmation.experiences}</dt>
-            <dd className="text-ink">{booking.experience_ids?.length ?? 0} added</dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">{t.confirmation.total}</dt>
-            <dd className="font-mono text-ink">{rupiah(Number(booking.total_amount))}</dd>
-          </div>
-        </dl>
-      </div>
-
-      {splitRows.length > 0 && (
-        <div className="mt-6 rounded-xl bg-ink p-6 text-paper">
-          <p className="text-xs font-semibold uppercase tracking-wide text-gold">
-            {t.confirmation.moneyLabel}
-          </p>
-          <div className="mt-4 flex h-2.5 overflow-hidden rounded-full">
-            {splitRows.map((r) => (
-              <div key={r.label} style={{ width: `${r.pct}%` }} className={r.bg} />
-            ))}
-          </div>
-          <dl className="mt-4 space-y-2 text-sm">
-            {splitRows.map((r) => (
-              <div key={r.label} className="flex items-center justify-between">
-                <dt className="flex items-center gap-2 text-paper/80">
-                  <span className={`h-2.5 w-2.5 rounded-full ${r.bg}`} />
-                  {r.label} · {r.pct}%
-                </dt>
-                <dd className="font-mono text-paper">{rupiah(Number(r.amount))}</dd>
-              </div>
-            ))}
-          </dl>
-        </div>
-      )}
-
-      {(booking.status === "confirmed" || booking.status === "completed") && (
-        <div className="mt-10">
-          {existingReview ? (
-            <div className="rounded-xl border border-palm/30 bg-palm/5 p-6">
-              <p className="font-display text-xl font-semibold text-palm">
-                {t.confirmation.alreadyReviewed}
-              </p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                {t.confirmation.alreadyReviewedNote}
-              </p>
-            </div>
-          ) : (
-            <ReviewForm bookingId={id} />
-          )}
-        </div>
-      )}
-
-      <Link
-        href="/villages"
-        className="mt-10 inline-block text-sm font-medium text-palm hover:text-clay"
-      >
-        {t.confirmation.back}
-      </Link>
-    </div>
-  );
+  return { ok: true, bookingId: booking.id };
 }
